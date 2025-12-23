@@ -377,6 +377,8 @@ Be concise but helpful. Use a warm and engaging tone.`,
             processor.onaudioprocess = (event) => {
                 if (!state.isConnected || !state.websocket) return;
 
+                console.log('Sending audio chunk');
+
                 const inputData = event.inputBuffer.getChannelData(0);
                 
                 // Float32 -> Int16 PCM
