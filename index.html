@@ -401,6 +401,7 @@ Be concise but helpful. Use a warm and engaging tone.`,
         // ==================== 服务器事件处理 ====================
 
         function handleServerEvent(event) {
+            console.log('Server event:', event.type, event);
             switch (event.type) {
                 case 'session.created':
                     console.log('Session created:', event.session?.id);
