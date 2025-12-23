@@ -108,7 +108,6 @@
             font-size: 0.9rem;
         }
 
-        /* 移动端优化 */
         @media (max-width: 480px) {
             .logo {
                 font-size: 2.5rem;
@@ -145,15 +144,10 @@
     <script>
         // ==================== 配置 ====================
         const CONFIG = {
-            // 替换为你的 token 服务地址
             tokenEndpoint: 'https://grok.lucianlee.space/token',
-            // Grok Realtime API WebSocket 地址
             wsEndpoint: 'wss://api.x.ai/v1/realtime',
-            // 语音设置
             voice: 'Eve',
-            // 音频设置
             sampleRate: 24000,
-            // Session 配置
             instructions: `You are Grok, a helpful and friendly AI assistant created by xAI. 
 You have access to real-time information through web search and X (Twitter) search.
 Respond naturally in the same language the user speaks.
@@ -168,7 +162,8 @@ Be concise but helpful. Use a warm and engaging tone.`,
             websocket: null,
             audioContext: null,
             mediaStream: null,
-            audioWorklet: null,
+            sourceNode: null,
+            workletNode: null,
             playbackQueue: [],
             isPlaying: false,
         };
@@ -178,6 +173,43 @@ Be concise but helpful. Use a warm and engaging tone.`,
         const statusEl = document.getElementById('status');
         const errorMessage = document.getElementById('errorMessage');
         const buttonIcon = document.getElementById('buttonIcon');
+
+        // ==================== AudioWorklet 处理器代码 ====================
+        const workletCode = `
+            class AudioProcessor extends AudioWorkletProcessor {
+                constructor() {
+                    super();
+                    this.bufferSize = 2048;
+                    this.buffer = new Float32Array(this.bufferSize);
+                    this.bufferIndex = 0;
+                }
+
+                process(inputs, outputs, parameters) {
+                    const input = inputs[0];
+                    if (input && input[0]) {
+                        const inputData = input[0];
+                        
+                        for (let i = 0; i < inputData.length; i++) {
+                            this.buffer[this.bufferIndex++] = inputData[i];
+                            
+                            if (this.bufferIndex >= this.bufferSize) {
+                                const pcmData = new Int16Array(this.bufferSize);
+                                for (let j = 0; j < this.bufferSize; j++) {
+                                    const s = Math.max(-1, Math.min(1, this.buffer[j]));
+                                    pcmData[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                                }
+                                
+                                this.port.postMessage(pcmData.buffer, [pcmData.buffer]);
+                                this.buffer = new Float32Array(this.bufferSize);
+                                this.bufferIndex = 0;
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+            registerProcessor('audio-processor', AudioProcessor);
+        `;
 
         // ==================== 主要功能 ====================
 
@@ -194,16 +226,9 @@ Be concise but helpful. Use a warm and engaging tone.`,
                 updateStatus('connecting', '连接中');
                 hideError();
 
-                // 1. 获取 ephemeral token
                 const token = await getEphemeralToken();
-
-                // 2. 请求麦克风权限
                 await initAudio();
-
-                // 3. 建立 WebSocket 连接
                 await connectWebSocket(token);
-
-                // 4. 配置 session
                 await configureSession();
 
                 state.isConnected = true;
@@ -218,13 +243,21 @@ Be concise but helpful. Use a warm and engaging tone.`,
         }
 
         function disconnect() {
-            // 关闭 WebSocket
             if (state.websocket) {
                 state.websocket.close();
                 state.websocket = null;
             }
 
-            // 停止音频
+            if (state.workletNode) {
+                state.workletNode.disconnect();
+                state.workletNode = null;
+            }
+
+            if (state.sourceNode) {
+                state.sourceNode.disconnect();
+                state.sourceNode = null;
+            }
+
             if (state.mediaStream) {
                 state.mediaStream.getTracks().forEach(track => track.stop());
                 state.mediaStream = null;
@@ -235,7 +268,6 @@ Be concise but helpful. Use a warm and engaging tone.`,
                 state.audioContext = null;
             }
 
-            // 重置状态
             state.isConnected = false;
             state.isListening = false;
             state.isSpeaking = false;
@@ -269,7 +301,6 @@ Be concise but helpful. Use a warm and engaging tone.`,
         // ==================== 音频初始化 ====================
 
         async function initAudio() {
-            // 请求麦克风权限
             state.mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     sampleRate: CONFIG.sampleRate,
@@ -280,15 +311,35 @@ Be concise but helpful. Use a warm and engaging tone.`,
                 }
             });
 
-            // 创建 AudioContext
             state.audioContext = new (window.AudioContext || window.webkitAudioContext)({
                 sampleRate: CONFIG.sampleRate,
             });
 
-            // 如果被暂停，恢复 AudioContext
             if (state.audioContext.state === 'suspended') {
                 await state.audioContext.resume();
             }
+
+            // 创建 AudioWorklet
+            const blob = new Blob([workletCode], { type: 'application/javascript' });
+            const workletUrl = URL.createObjectURL(blob);
+            await state.audioContext.audioWorklet.addModule(workletUrl);
+            URL.revokeObjectURL(workletUrl);
+
+            state.workletNode = new AudioWorkletNode(state.audioContext, 'audio-processor');
+            state.sourceNode = state.audioContext.createMediaStreamSource(state.mediaStream);
+
+            // 处理 worklet 发来的音频数据
+            state.workletNode.port.onmessage = (event) => {
+                if (state.isConnected && state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+                    const base64Audio = arrayBufferToBase64(event.data);
+                    sendEvent({
+                        type: 'input_audio_buffer.append',
+                        audio: base64Audio
+                    });
+                }
+            };
+
+            state.sourceNode.connect(state.workletNode);
         }
 
         // ==================== WebSocket 连接 ====================
@@ -323,7 +374,6 @@ Be concise but helpful. Use a warm and engaging tone.`,
                     handleServerEvent(JSON.parse(event.data));
                 };
 
-                // 超时处理
                 setTimeout(() => {
                     if (ws.readyState !== WebSocket.OPEN) {
                         ws.close();
@@ -363,47 +413,13 @@ Be concise but helpful. Use a warm and engaging tone.`,
             };
 
             sendEvent(sessionConfig);
-
-            // 开始发送音频
-            startAudioCapture();
-        }
-
-        // ==================== 音频采集 ====================
-
-        function startAudioCapture() {
-            const source = state.audioContext.createMediaStreamSource(state.mediaStream);
-            const processor = state.audioContext.createScriptProcessor(4096, 1, 1);
-
-            processor.onaudioprocess = (event) => {
-                if (!state.isConnected || !state.websocket) return;
-
-                console.log('Sending audio chunk');
-
-                const inputData = event.inputBuffer.getChannelData(0);
-                
-                // Float32 -> Int16 PCM
-                const pcmData = new Int16Array(inputData.length);
-                for (let i = 0; i < inputData.length; i++) {
-                    const s = Math.max(-1, Math.min(1, inputData[i]));
-                    pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                }
-
-                // Base64 编码并发送
-                const base64Audio = arrayBufferToBase64(pcmData.buffer);
-                sendEvent({
-                    type: 'input_audio_buffer.append',
-                    audio: base64Audio
-                });
-            };
-
-            source.connect(processor);
-            processor.connect(state.audioContext.destination);
         }
 
         // ==================== 服务器事件处理 ====================
 
         function handleServerEvent(event) {
-            console.log('Server event:', event.type, event);
+            console.log('Server event:', event.type);
+
             switch (event.type) {
                 case 'session.created':
                     console.log('Session created:', event.session?.id);
@@ -432,6 +448,7 @@ Be concise but helpful. Use a warm and engaging tone.`,
                     break;
 
                 case 'response.audio.done':
+                case 'response.output_audio.done':
                     break;
 
                 case 'response.created':
@@ -457,6 +474,7 @@ Be concise but helpful. Use a warm and engaging tone.`,
         // ==================== 音频播放 ====================
 
         function queueAudio(base64Audio) {
+            console.log('queueAudio called, length:', base64Audio.length);
             const pcmData = base64ToInt16Array(base64Audio);
             state.playbackQueue.push(pcmData);
 
@@ -475,24 +493,33 @@ Be concise but helpful. Use a warm and engaging tone.`,
                 return;
             }
 
+            if (!state.audioContext) {
+                state.isPlaying = false;
+                return;
+            }
+
             state.isPlaying = true;
             const pcmData = state.playbackQueue.shift();
 
-            // Int16 -> Float32
             const floatData = new Float32Array(pcmData.length);
             for (let i = 0; i < pcmData.length; i++) {
                 floatData[i] = pcmData[i] / 0x8000;
             }
 
-            // 创建并播放 AudioBuffer
-            const audioBuffer = state.audioContext.createBuffer(1, floatData.length, CONFIG.sampleRate);
-            audioBuffer.getChannelData(0).set(floatData);
+            try {
+                const audioBuffer = state.audioContext.createBuffer(1, floatData.length, CONFIG.sampleRate);
+                audioBuffer.getChannelData(0).set(floatData);
 
-            const source = state.audioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(state.audioContext.destination);
-            source.onended = () => playNextChunk();
-            source.start();
+                const source = state.audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(state.audioContext.destination);
+                source.onended = () => playNextChunk();
+                source.start();
+                console.log('Playing audio chunk, samples:', floatData.length);
+            } catch (error) {
+                console.error('Error playing audio:', error);
+                playNextChunk();
+            }
         }
 
         function stopPlayback() {
@@ -531,7 +558,6 @@ Be concise but helpful. Use a warm and engaging tone.`,
         function updateStatus(statusType, message) {
             statusEl.textContent = message;
 
-            // 更新按钮样式
             voiceButton.className = 'voice-button';
             if (statusType === 'connecting') {
                 voiceButton.classList.add('connecting');
@@ -541,14 +567,12 @@ Be concise but helpful. Use a warm and engaging tone.`,
                 voiceButton.classList.add('speaking');
             }
 
-            // 更新图标
             if (statusType === 'disconnected') {
                 buttonIcon.innerHTML = `
                     <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/>
                     <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
                 `;
             } else {
-                // 连接状态下显示停止图标
                 buttonIcon.innerHTML = `
                     <rect x="6" y="6" width="12" height="12" rx="2"/>
                 `;
