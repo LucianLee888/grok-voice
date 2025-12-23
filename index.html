@@ -259,11 +259,11 @@ Be concise but helpful. Use a warm and engaging tone.`,
 
             const data = await response.json();
             
-            if (!data.client_secret?.value) {
+            if (!data.value) {
                 throw new Error('Token 格式错误');
             }
 
-            return data.client_secret.value;
+            return data.value;
         }
 
         // ==================== 音频初始化 ====================
